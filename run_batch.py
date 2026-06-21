@@ -2,29 +2,21 @@
 """
 Batch evaluasi: grid (cover x payload) -> CSV PSNR/SSIM.
 
-Paralel antar sel via ProcessPoolExecutor (spawn).
-Pencarian seed+r di tiap sel serial by default (hindari spawn di dalam spawn).
+Setiap sel dijalankan di subprocess terpisah agar segfault/OOM worker
+tidak mematikan batch runner. Paralel antar sel memakai thread + subprocess.
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
-import inspect
-import os
-import time
-from concurrent.futures import BrokenExecutor, ProcessPoolExecutor, as_completed
-
-try:
-    from concurrent.futures.process import BrokenProcessPool
-except ImportError:
-    BrokenProcessPool = BrokenExecutor  # type: ignore[misc, assignment]
-
 import multiprocessing as mp
+import os
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-_POOL_ERRORS = (BrokenExecutor, BrokenProcessPool, OSError, RuntimeError)
-
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 for _var in (
     "OMP_NUM_THREADS",
@@ -57,6 +49,7 @@ SEED_CANDIDATES = tuple(range(0, 16))
 R_CANDIDATES = (3, 4, 5, 6, 7)
 EMBED_SCOPE = "ALL_CHANNELS"
 IMAGE_MODE = "RGB"
+DEFAULT_CELL_TIMEOUT = 7200
 
 COVERS = [
     ("Tree", "cover_images/Tree.tiff"),
@@ -96,16 +89,29 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="HMF batch PSNR/SSIM")
     p.add_argument("--virtual-key", type=int, default=5, choices=sorted(KEY_TO_MODE))
     p.add_argument("--no-huffman", action="store_true")
-    p.add_argument("--workers", type=int, default=None, help="worker antar-sel")
-    p.add_argument("--search-workers", type=int, default=None, help="worker pencarian seed+r (hanya dengan --parallel-search)")
-    p.add_argument("--parallel-search", action="store_true", help="paralel seed+r di tiap sel (hanya aman dengan --serial)")
+    p.add_argument("--workers", type=int, default=None, help="subprocess paralel antar sel")
+    p.add_argument("--search-workers", type=int, default=None, help="worker pencarian seed+r (--parallel-search)")
+    p.add_argument("--parallel-search", action="store_true", help="paralel seed+r (thread) di tiap sel")
+    p.add_argument("--cell-timeout", type=int, default=DEFAULT_CELL_TIMEOUT, help="timeout per sel (detik)")
     p.add_argument("--output-dir", default="output")
-    p.add_argument("--serial", action="store_true", help="tanpa paralel antar-sel")
+    p.add_argument("--serial", action="store_true", help="satu sel per waktu (subprocess serial)")
     return p.parse_args()
 
 
 def _isfinite(x: float) -> bool:
     return x == x and x not in (float("inf"), float("-inf"))
+
+
+def _base_row(task: Tuple, cfg: Dict) -> Dict:
+    cover_label, _, payload_label, _ = task
+    row = {k: "" for k in FIELDNAMES}
+    row.update({
+        "cover": cover_label,
+        "payload": payload_label,
+        "virtual_key": cfg["virtual_key"],
+        "virtual_mode": cfg["virtual_mode"],
+    })
+    return row
 
 
 def _fill_zero_metrics(row: Dict, *, status: str = "ERROR") -> None:
@@ -129,11 +135,7 @@ def _fill_zero_metrics(row: Dict, *, status: str = "ERROR") -> None:
 def _run_cell(task: Tuple, cfg: Dict) -> Dict:
     cover_label, cover_rel, payload_label, payload_rel = task
     t0 = time.time()
-    row = {k: "" for k in FIELDNAMES}
-    row["cover"] = cover_label
-    row["payload"] = payload_label
-    row["virtual_key"] = cfg["virtual_key"]
-    row["virtual_mode"] = cfg["virtual_mode"]
+    row = _base_row(task, cfg)
 
     try:
         cover = load_image(BASE / cover_rel, mode=IMAGE_MODE)
@@ -227,6 +229,51 @@ def _run_cell(task: Tuple, cfg: Dict) -> Dict:
     return row
 
 
+def _cell_worker_entry(task: Tuple, cfg: Dict, result_queue: mp.Queue) -> None:
+    try:
+        result_queue.put(_run_cell(task, cfg))
+    except Exception as exc:
+        row = _base_row(task, cfg)
+        _fill_zero_metrics(row, status=f"ERROR: {type(exc).__name__}: {exc}")
+        row["seconds"] = "0"
+        result_queue.put(row)
+
+
+def _run_cell_isolated(
+    task: Tuple,
+    cfg: Dict,
+    *,
+    timeout: int,
+) -> Dict:
+    ctx = mp.get_context("spawn")
+    result_queue: mp.Queue = ctx.Queue(maxsize=1)
+    proc = ctx.Process(target=_cell_worker_entry, args=(task, cfg, result_queue), daemon=False)
+    proc.start()
+    proc.join(timeout=max(1, int(timeout)))
+
+    if proc.is_alive():
+        proc.terminate()
+        proc.join(5)
+        row = _base_row(task, cfg)
+        _fill_zero_metrics(row, status="ERROR: TIMEOUT")
+        row["seconds"] = str(timeout)
+        return row
+
+    if proc.exitcode not in (0, None):
+        row = _base_row(task, cfg)
+        _fill_zero_metrics(row, status=f"WORKER_FAIL: exitcode={proc.exitcode}")
+        row["seconds"] = "0"
+        return row
+
+    try:
+        return result_queue.get_nowait()
+    except Exception:
+        row = _base_row(task, cfg)
+        _fill_zero_metrics(row, status="WORKER_FAIL: NO_RESULT")
+        row["seconds"] = "0"
+        return row
+
+
 def _matrix_value(row: Dict, field: str) -> str:
     status = row.get("status", "")
     if status == "EXCEEDS_CAPACITY":
@@ -259,79 +306,43 @@ def _write_detail_csv(path: Path, tasks: List[Tuple], results: Dict) -> None:
                 writer.writerow(row)
 
 
-def _run_cells(tasks: List[Tuple], cfg: Dict, *, label: str) -> Dict[Tuple[str, str], Dict]:
+def _run_cells(tasks: List[Tuple], cfg: Dict) -> Dict[Tuple[str, str], Dict]:
     results: Dict[Tuple[str, str], Dict] = {}
     total = len(tasks)
-    failed_tasks: List[Tuple] = []
+    timeout = int(cfg.get("cell_timeout", DEFAULT_CELL_TIMEOUT))
+    serial = bool(cfg.get("serial"))
+    max_workers = 1 if serial else (cfg.get("workers") or min(os.cpu_count() or 1, 2))
 
     def record(row: Dict, idx: int) -> None:
-        key = (row["cover"], row["payload"])
-        results[key] = row
-        prefix = f"{label} " if label else ""
+        results[(row["cover"], row["payload"])] = row
         print(
-            f"[{prefix}{idx}/{total}] {row['cover']} x {row['payload']}: "
+            f"[{idx}/{total}] {row['cover']} x {row['payload']}: "
             f"{row['status']} | seed={row['seed']} r={row['matrix_r']} "
             f"PSNR={row['psnr_db']} SSIM={row['ssim']} ({row['seconds']}s)",
             flush=True,
         )
 
-    if cfg.get("serial"):
+    run_one = lambda task: _run_cell_isolated(task, cfg, timeout=timeout)
+
+    if serial or max_workers <= 1:
+        print(f"Batch: {total} sel, subprocess serial (timeout={timeout}s)", flush=True)
         for i, task in enumerate(tasks, 1):
-            record(_run_cell(task, cfg), i)
+            record(run_one(task), i)
         return results
 
-    max_workers = cfg.get("workers") or min(os.cpu_count() or 1, 4)
-    ctx = mp.get_context("spawn")
-    pool_kwargs = {"max_workers": max_workers, "mp_context": ctx}
-    if "max_tasks_per_child" in inspect.signature(ProcessPoolExecutor).parameters:
-        pool_kwargs["max_tasks_per_child"] = 1
-
-    print(f"Batch: {total} sel, {max_workers} worker spawn", flush=True)
-    done = 0
-    pending = dict.fromkeys(tasks, True)
-
-    try:
-        with ProcessPoolExecutor(**pool_kwargs) as pool:
-            futures = {pool.submit(_run_cell, t, cfg): t for t in tasks}
-            for fut in as_completed(futures):
-                done += 1
-                task = futures[fut]
-                pending.pop(task, None)
-                try:
-                    row = fut.result()
-                except _POOL_ERRORS as exc:
-                    failed_tasks.append(task)
-                    cl, _, pl, _ = task
-                    row = {k: "" for k in FIELDNAMES}
-                    row.update({
-                        "cover": cl,
-                        "payload": pl,
-                        "virtual_key": cfg["virtual_key"],
-                        "virtual_mode": cfg["virtual_mode"],
-                    })
-                    _fill_zero_metrics(row, status=f"WORKER_FAIL: {type(exc).__name__}")
-                except Exception as exc:
-                    failed_tasks.append(task)
-                    cl, _, pl, _ = task
-                    row = {k: "" for k in FIELDNAMES}
-                    row.update({
-                        "cover": cl,
-                        "payload": pl,
-                        "virtual_key": cfg["virtual_key"],
-                        "virtual_mode": cfg["virtual_mode"],
-                    })
-                    _fill_zero_metrics(row, status=f"WORKER_FAIL: {type(exc).__name__}")
-                record(row, done)
-    except _POOL_ERRORS as exc:
-        print(f"[pool rusak: {type(exc).__name__}: {exc}] -> retry sisa sel serial", flush=True)
-        failed_tasks.extend(task for task in pending)
-
-    if failed_tasks:
-        retry_cfg = {**cfg, "serial": True, "parallel_search": False}
-        unique_failed = list(dict.fromkeys(failed_tasks))
-        print(f"\nRetry {len(unique_failed)} sel gagal (serial)...", flush=True)
-        for i, task in enumerate(unique_failed, 1):
-            record(_run_cell(task, retry_cfg), i)
+    print(f"Batch: {total} sel, {max_workers} subprocess paralel (timeout={timeout}s)", flush=True)
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {pool.submit(run_one, task): (i, task) for i, task in enumerate(tasks, 1)}
+        for fut in as_completed(futures):
+            idx, _ = futures[fut]
+            try:
+                row = fut.result()
+            except Exception as exc:
+                _, task = futures[fut]
+                row = _base_row(task, cfg)
+                _fill_zero_metrics(row, status=f"WORKER_FAIL: {type(exc).__name__}")
+                row["seconds"] = "0"
+            record(row, idx)
 
     return results
 
@@ -343,7 +354,7 @@ def run_batch(cfg: Dict) -> None:
     detail_path = out_dir / "results_psnr_ssim.csv"
 
     t_batch = time.time()
-    results = _run_cells(tasks, cfg, label="")
+    results = _run_cells(tasks, cfg)
     _write_detail_csv(detail_path, tasks, results)
 
     payload_labels = [pl for pl, _ in PAYLOADS]
@@ -359,16 +370,6 @@ def run_batch(cfg: Dict) -> None:
 
 def main() -> None:
     args = parse_args()
-    batch_parallel = not args.serial
-    parallel_search = args.parallel_search
-    if batch_parallel and parallel_search:
-        print(
-            "Peringatan: --parallel-search dinonaktifkan saat batch paralel "
-            "(spawn di dalam spawn tidak stabil). Gunakan --serial --parallel-search jika perlu.",
-            flush=True,
-        )
-        parallel_search = False
-
     cfg = {
         "virtual_key": args.virtual_key,
         "virtual_mode": resolve_mode(args.virtual_key),
@@ -377,7 +378,8 @@ def main() -> None:
         "search_workers": args.search_workers,
         "output_dir": args.output_dir,
         "serial": args.serial,
-        "parallel_search": parallel_search,
+        "parallel_search": args.parallel_search,
+        "cell_timeout": args.cell_timeout,
     }
     run_batch(cfg)
 

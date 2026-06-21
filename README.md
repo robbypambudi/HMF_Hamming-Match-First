@@ -52,10 +52,11 @@ Produces:
 - `output/ssim_matrix.csv`
 
 Options:
-- `--workers 8` — parallelize across cells
-- `--search-workers 4` — parallel seed+r search within each cell (requires `--serial --parallel-search`)
-- `--parallel-search` — enable parallel seed+r search (only safe with `--serial`)
-- `--serial` — disable parallelism across cells
+- `--workers 2` — run up to N cells in parallel (each in its own subprocess)
+- `--serial` — one cell at a time (safest, recommended on low-memory machines)
+- `--cell-timeout 7200` — per-cell timeout in seconds (default 7200)
+- `--parallel-search` — parallel seed+r search (threads) inside each cell
+- `--search-workers 4` — thread count for `--parallel-search`
 
 ## Module layout
 
@@ -160,8 +161,8 @@ python3 run_embed.py --virtual-key 6 --seed 42 --matrix-r 4 --no-parallel
 
 ## Multiprocessing notes
 
-Parallel search uses `spawn` (not `fork`) so it is safe on macOS after numpy is imported. BLAS threads are limited to 1 via environment variables.
+Parallel search uses threads (not child processes) to avoid nested `spawn` issues. BLAS threads are limited to 1 via environment variables.
 
-Parallel seed+r search uses threads (not child processes) to avoid `BrokenProcessPool` / segfault from nested `spawn`.
+Each batch cell runs in an **isolated subprocess**. If a cell crashes (segfault/OOM), the batch runner continues and writes `0` for that cell's metrics. Use `--serial` on low-memory machines; use `--workers 2` at most for parallel cells.
 
-Failed cells are retried automatically in serial mode before the CSV is written. On persistent failure, numeric metrics are written as `0` in the CSV (status column records the error).
+On persistent failure, numeric metrics are written as `0` in the CSV (`status` column records the error).
