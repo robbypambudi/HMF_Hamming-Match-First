@@ -176,6 +176,14 @@ def main() -> None:
     print("\n=== Hasil ===")
     print(f"Blok        : {stats.n_blocks:,} (tanpa flip: {stats.n_no_flip_blocks:,})")
     print(f"Flips       : {stats.n_flips:,} ({stats.flips_per_bit:.4%} per bit)")
+    print(
+        f"Bit tanpa flip: {stats.n_no_flip_bits:,} "
+        f"({stats.no_flip_bit_ratio:.4%} payload, tanpa flip fisik ±1)"
+    )
+    print(
+        f"Bit terflip   : {stats.n_flip_bits:,} "
+        f"({1 - stats.no_flip_bit_ratio:.4%} payload, memerlukan flip fisik ±1)"
+    )
     print(f"Matrix r    : {matrix_r} (n={matrix_block_n(matrix_r)} pixel, k={matrix_r})")
     print(f"Key mode    : {args.virtual_key} = {KEY_LABELS[args.virtual_key]}")
     print(f"MSE / PSNR  : {mse:.6f} / {psnr_val:.4f} dB" if np.isfinite(psnr_val) else f"MSE / PSNR  : {mse:.6f} / inf")

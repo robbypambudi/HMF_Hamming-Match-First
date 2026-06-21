@@ -79,6 +79,7 @@ FIELDNAMES = [
     "payload_bits_raw", "payload_bits_embedded", "compression",
     "virtual_key", "virtual_mode",
     "seed", "matrix_r", "capacity_bits", "n_flips", "flips_per_bit",
+    "n_no_flip_bits", "no_flip_bit_ratio", "n_flip_bits",
     "mse", "psnr_db", "ssim", "lossless", "seconds", "status",
 ]
 
@@ -178,6 +179,9 @@ def _run_cell(task: Tuple, cfg: Dict) -> Dict:
             "capacity_bits": cap,
             "n_flips": stats.n_flips,
             "flips_per_bit": f"{stats.flips_per_bit:.8f}",
+            "n_no_flip_bits": stats.n_no_flip_bits,
+            "no_flip_bit_ratio": f"{stats.no_flip_bit_ratio:.8f}",
+            "n_flip_bits": stats.n_flip_bits,
             "mse": f"{mse:.8f}",
             "psnr_db": "inf" if not _isfinite(psnr_val) else f"{psnr_val:.6f}",
             "ssim": f"{ssim_val:.8f}",

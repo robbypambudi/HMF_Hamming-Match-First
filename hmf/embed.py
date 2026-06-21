@@ -109,12 +109,17 @@ def embed_hamming_matchfirst_lsb(
     n_flips = 0
     n_blocks = payload_blocks.shape[0]
     n_no_flip = 0
+    n_no_flip_bits = 0
+    n_bits = len(payload_bits)
 
     for bi, target_channels in enumerate(payload_blocks):
         idx_block = perm[bi * block_n : (bi + 1) * block_n]
         block_flips = 0
 
         for ci, target in enumerate(target_channels):
+            unit_bit_start = bi * bits_per_block + ci * msg_k
+            unit_bits = min(msg_k, max(0, n_bits - unit_bit_start))
+
             if plugin.is_adaptive:
                 lsb_block = (carrier[idx_block, ci] & 1).astype(np.uint8)
                 delta = syndrome(lsb_block, matrix_r) ^ target
@@ -137,6 +142,8 @@ def embed_hamming_matchfirst_lsb(
                 pos = syndrome_to_pos(syndrome(lsb_block, matrix_r) ^ target)
 
             if pos == 0:
+                if unit_bits > 0:
+                    n_no_flip_bits += unit_bits
                 continue
 
             flip_idx = int(idx_block[pos - 1])
@@ -148,10 +155,11 @@ def embed_hamming_matchfirst_lsb(
             n_no_flip += 1
 
     stats = EmbedStats(
-        n_bits=len(payload_bits),
+        n_bits=n_bits,
         n_blocks=n_blocks,
         n_no_flip_blocks=n_no_flip,
         n_flips=n_flips,
+        n_no_flip_bits=n_no_flip_bits,
         virtual_choices=virtual_choices,
     )
     return stego, stats
