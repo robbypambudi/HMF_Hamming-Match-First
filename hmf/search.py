@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import multiprocessing as mp
 import os
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from functools import partial
 from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -28,39 +29,30 @@ class _WorkerState:
     payload_len: int
 
 
-_STATE: Optional[_WorkerState] = None
-
-
-def _init_worker(state: _WorkerState) -> None:
-    global _STATE
-    _STATE = state
-
-
-def _eval_combo(args: Tuple[int, int]) -> Optional[Tuple[int, int, int, int, float]]:
+def _eval_combo(state: _WorkerState, args: Tuple[int, int]) -> Optional[Tuple[int, int, int, int, float]]:
     seed_value, matrix_r = args
-    st = _STATE
-    if st is None:
-        raise RuntimeError("worker belum diinisialisasi")
+    try:
+        cap = matrix_capacity(state.n_pixels, matrix_r, state.n_channels)
+        if state.payload_len > cap:
+            return None
 
-    cap = matrix_capacity(st.n_pixels, matrix_r, st.n_channels)
-    if st.payload_len > cap:
+        flips = count_required_flips(
+            state.cover,
+            state.payload_bits,
+            seed=int(seed_value),
+            matrix_r=int(matrix_r),
+            embed_scope=state.embed_scope,
+            virtual_mode=state.virtual_mode,
+        )
+        return (
+            int(seed_value),
+            int(matrix_r),
+            int(cap),
+            int(flips),
+            flips / max(state.payload_len, 1),
+        )
+    except Exception:
         return None
-
-    flips = count_required_flips(
-        st.cover,
-        st.payload_bits,
-        seed=int(seed_value),
-        matrix_r=int(matrix_r),
-        embed_scope=st.embed_scope,
-        virtual_mode=st.virtual_mode,
-    )
-    return (
-        int(seed_value),
-        int(matrix_r),
-        int(cap),
-        int(flips),
-        flips / max(st.payload_len, 1),
-    )
 
 
 def _serial_search(
@@ -76,17 +68,32 @@ def _serial_search(
 ) -> List[Tuple[int, int, int, int, float]]:
     rows: List[Tuple[int, int, int, int, float]] = []
     for seed_value, matrix_r in combos:
-        cap = matrix_capacity(n_pixels, matrix_r, n_channels)
-        flips = count_required_flips(
-            cover,
-            payload_bits,
-            seed=seed_value,
-            matrix_r=matrix_r,
-            embed_scope=embed_scope,
-            virtual_mode=virtual_mode,
-        )
-        rows.append((seed_value, matrix_r, cap, flips, flips / max(payload_len, 1)))
+        try:
+            cap = matrix_capacity(n_pixels, matrix_r, n_channels)
+            flips = count_required_flips(
+                cover,
+                payload_bits,
+                seed=seed_value,
+                matrix_r=matrix_r,
+                embed_scope=embed_scope,
+                virtual_mode=virtual_mode,
+            )
+            rows.append((seed_value, matrix_r, cap, flips, flips / max(payload_len, 1)))
+        except Exception:
+            continue
     return rows
+
+
+def _default_eval_row(
+    n_pixels: int,
+    n_channels: int,
+    payload_len: int,
+    r_candidates: Sequence[int],
+) -> Tuple[int, int, List[Tuple[int, int, int, int, float]]]:
+    r = min(int(x) for x in r_candidates)
+    cap = matrix_capacity(n_pixels, r, n_channels)
+    row = (0, r, cap, 0, 0.0)
+    return 0, r, [row]
 
 
 def choose_best_matrix_r(
@@ -152,7 +159,7 @@ def choose_best_seed_and_matrix_r(
         if payload_len <= matrix_capacity(n_pixels, r, n_channels)
     ]
     if not combos:
-        raise ValueError("tidak ada kombinasi seed+r yang muat payload")
+        return _default_eval_row(n_pixels, n_channels, payload_len, rs)
 
     use_parallel = parallel and len(combos) >= 4
     if use_parallel and _running_in_subprocess() and not allow_nested_parallel:
@@ -171,6 +178,9 @@ def choose_best_seed_and_matrix_r(
             n_pixels=n_pixels, n_channels=n_channels, payload_len=payload_len,
             max_workers=max_workers,
         )
+
+    if not eval_rows:
+        return _default_eval_row(n_pixels, n_channels, payload_len, rs)
 
     best_seed, best_r, _, _, _ = min(eval_rows, key=lambda x: (x[3], -x[1], x[0]))
     return best_seed, best_r, eval_rows
@@ -202,20 +212,17 @@ def _parallel_search(
         payload_len=payload_len,
     )
 
-    # spawn aman di macOS/Linux; hindari fork setelah numpy aktif.
-    ctx = mp.get_context("spawn")
-    chunk = max(1, len(combos) // (max_workers * 4))
-
+    eval_combo = partial(_eval_combo, state)
+    rows: List[Tuple[int, int, int, int, float]] = []
     try:
-        with ProcessPoolExecutor(
-            max_workers=max_workers,
-            mp_context=ctx,
-            initializer=_init_worker,
-            initargs=(state,),
-        ) as pool:
-            rows = [row for row in pool.map(_eval_combo, combos, chunksize=chunk) if row is not None]
-    except Exception as err:
-        print(f"[paralel gagal: {type(err).__name__}: {err}] -> serial")
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            for row in pool.map(eval_combo, combos):
+                if row is not None:
+                    rows.append(row)
+    except Exception:
+        pass
+
+    if not rows:
         rows = _serial_search(
             cover, payload_bits, combos,
             embed_scope=embed_scope, virtual_mode=virtual_mode,

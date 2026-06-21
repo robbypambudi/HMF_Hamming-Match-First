@@ -162,6 +162,6 @@ python3 run_embed.py --virtual-key 6 --seed 42 --matrix-r 4 --no-parallel
 
 Parallel search uses `spawn` (not `fork`) so it is safe on macOS after numpy is imported. BLAS threads are limited to 1 via environment variables.
 
-Batch mode parallelizes **across cells only** by default. Nested `spawn` inside worker processes (batch parallel + seed+r parallel) is unstable and can cause `BrokenProcessPool` / pickle errors. Use `--serial --parallel-search` if you need parallel seed+r search instead.
+Parallel seed+r search uses threads (not child processes) to avoid `BrokenProcessPool` / segfault from nested `spawn`.
 
-Failed cells are retried automatically in serial mode before the CSV is written.
+Failed cells are retried automatically in serial mode before the CSV is written. On persistent failure, numeric metrics are written as `0` in the CSV (status column records the error).

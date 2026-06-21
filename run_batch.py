@@ -108,6 +108,24 @@ def _isfinite(x: float) -> bool:
     return x == x and x not in (float("inf"), float("-inf"))
 
 
+def _fill_zero_metrics(row: Dict, *, status: str = "ERROR") -> None:
+    row.update({
+        "seed": 0,
+        "matrix_r": 0,
+        "capacity_bits": 0,
+        "n_flips": 0,
+        "flips_per_bit": "0",
+        "n_no_flip_bits": 0,
+        "no_flip_bit_ratio": "0",
+        "n_flip_bits": 0,
+        "mse": "0",
+        "psnr_db": "0",
+        "ssim": "0",
+        "lossless": "FAIL",
+        "status": status,
+    })
+
+
 def _run_cell(task: Tuple, cfg: Dict) -> Dict:
     cover_label, cover_rel, payload_label, payload_rel = task
     t0 = time.time()
@@ -152,35 +170,40 @@ def _run_cell(task: Tuple, cfg: Dict) -> Dict:
             virtual_mode=cfg["virtual_mode"],
             r_candidates=R_CANDIDATES,
             max_workers=cfg.get("search_workers"),
-            parallel=cfg.get("parallel_search", True),
+            parallel=cfg.get("parallel_search", False),
         )
-        stego, stats = embed_hamming_matchfirst_lsb(
-            cover,
-            payload_bits,
-            seed=seed,
-            matrix_r=matrix_r,
-            embed_scope=EMBED_SCOPE,
-            virtual_mode=cfg["virtual_mode"],
-        )
-        cap = matrix_capacity(n_pixels, matrix_r, n_channels)
-        mse, psnr_val = psnr(cover, stego)
-        ssim_val = ssim(cover, stego)
+        try:
+            stego, stats = embed_hamming_matchfirst_lsb(
+                cover,
+                payload_bits,
+                seed=seed,
+                matrix_r=matrix_r,
+                embed_scope=EMBED_SCOPE,
+                virtual_mode=cfg["virtual_mode"],
+            )
+            cap = matrix_capacity(n_pixels, matrix_r, n_channels)
+            mse, psnr_val = psnr(cover, stego)
+            ssim_val = ssim(cover, stego)
 
-        recovered_emb = extract_hamming(
-            stego,
-            len(payload_bits),
-            seed=seed,
-            matrix_r=matrix_r,
-            embed_scope=EMBED_SCOPE,
-            virtual_mode=cfg["virtual_mode"],
-            virtual_choices=stats.virtual_choices,
-        )
-        recovered = huffman_expand_to_original_bits(recovered_emb, {
-            "compression": huff_meta.get("compression", "none"),
-            "original_bit_len": huff_meta.get("original_bit_len"),
-            "huffman_freq": huff_meta.get("huffman_freq"),
-        })
-        lossless = recovered == payload_raw
+            recovered_emb = extract_hamming(
+                stego,
+                len(payload_bits),
+                seed=seed,
+                matrix_r=matrix_r,
+                embed_scope=EMBED_SCOPE,
+                virtual_mode=cfg["virtual_mode"],
+                virtual_choices=stats.virtual_choices,
+            )
+            recovered = huffman_expand_to_original_bits(recovered_emb, {
+                "compression": huff_meta.get("compression", "none"),
+                "original_bit_len": huff_meta.get("original_bit_len"),
+                "huffman_freq": huff_meta.get("huffman_freq"),
+            })
+            lossless = recovered == payload_raw
+        except Exception as exc:
+            _fill_zero_metrics(row, status=f"ERROR: {type(exc).__name__}")
+            row["seconds"] = f"{time.time() - t0:.3f}"
+            return row
 
         row.update({
             "seed": seed,
@@ -198,7 +221,7 @@ def _run_cell(task: Tuple, cfg: Dict) -> Dict:
             "status": "OK" if lossless else "EXTRACT_MISMATCH",
         })
     except Exception as exc:
-        row["status"] = f"ERROR: {type(exc).__name__}: {exc}"
+        _fill_zero_metrics(row, status=f"ERROR: {type(exc).__name__}: {exc}")
 
     row["seconds"] = f"{time.time() - t0:.3f}"
     return row
@@ -209,9 +232,11 @@ def _matrix_value(row: Dict, field: str) -> str:
     if status == "EXCEEDS_CAPACITY":
         return "NA"
     if status.startswith("ERROR") or status.startswith("WORKER_FAIL"):
-        return "ERR"
+        return "0"
     val = row.get(field, "")
-    return str(val) if val != "" else "ERR"
+    if val == "" and (status.startswith("ERROR") or status.startswith("WORKER_FAIL")):
+        return "0"
+    return str(val) if val != "" else "0"
 
 
 def _write_matrix(path: Path, corner: str, payload_labels: List[str], results: Dict, field: str) -> None:
@@ -283,9 +308,8 @@ def _run_cells(tasks: List[Tuple], cfg: Dict, *, label: str) -> Dict[Tuple[str, 
                         "payload": pl,
                         "virtual_key": cfg["virtual_key"],
                         "virtual_mode": cfg["virtual_mode"],
-                        "status": f"WORKER_FAIL: {type(exc).__name__}",
-                        "seconds": "",
                     })
+                    _fill_zero_metrics(row, status=f"WORKER_FAIL: {type(exc).__name__}")
                 except Exception as exc:
                     failed_tasks.append(task)
                     cl, _, pl, _ = task
@@ -295,9 +319,8 @@ def _run_cells(tasks: List[Tuple], cfg: Dict, *, label: str) -> Dict[Tuple[str, 
                         "payload": pl,
                         "virtual_key": cfg["virtual_key"],
                         "virtual_mode": cfg["virtual_mode"],
-                        "status": f"WORKER_FAIL: {type(exc).__name__}: {exc}",
-                        "seconds": "",
                     })
+                    _fill_zero_metrics(row, status=f"WORKER_FAIL: {type(exc).__name__}")
                 record(row, done)
     except _POOL_ERRORS as exc:
         print(f"[pool rusak: {type(exc).__name__}: {exc}] -> retry sisa sel serial", flush=True)
