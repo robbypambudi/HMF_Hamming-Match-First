@@ -53,7 +53,8 @@ Produces:
 
 Options:
 - `--workers 8` — parallelize across cells
-- `--search-workers 4` — parallel seed+r search within each cell
+- `--search-workers 4` — parallel seed+r search within each cell (requires `--serial --parallel-search`)
+- `--parallel-search` — enable parallel seed+r search (only safe with `--serial`)
 - `--serial` — disable parallelism across cells
 
 ## Module layout
@@ -160,3 +161,7 @@ python3 run_embed.py --virtual-key 6 --seed 42 --matrix-r 4 --no-parallel
 ## Multiprocessing notes
 
 Parallel search uses `spawn` (not `fork`) so it is safe on macOS after numpy is imported. BLAS threads are limited to 1 via environment variables.
+
+Batch mode parallelizes **across cells only** by default. Nested `spawn` inside worker processes (batch parallel + seed+r parallel) is unstable and can cause `BrokenProcessPool` / pickle errors. Use `--serial --parallel-search` if you need parallel seed+r search instead.
+
+Failed cells are retried automatically in serial mode before the CSV is written.

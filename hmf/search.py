@@ -13,6 +13,10 @@ from hmf.hamming import carrier_vector, matrix_capacity
 from hmf.metrics import psnr_from_flips
 
 
+def _running_in_subprocess() -> bool:
+    return mp.current_process().name != "MainProcess"
+
+
 @dataclass(frozen=True)
 class _WorkerState:
     cover: np.ndarray
@@ -133,6 +137,7 @@ def choose_best_seed_and_matrix_r(
     r_candidates: Sequence[int] = (3, 4, 5, 6, 7),
     max_workers: Optional[int] = None,
     parallel: bool = True,
+    allow_nested_parallel: bool = False,
 ) -> Tuple[int, int, List[Tuple[int, int, int, int, float]]]:
     carrier = carrier_vector(cover, embed_scope=embed_scope)
     n_pixels, n_channels = carrier.shape
@@ -149,7 +154,11 @@ def choose_best_seed_and_matrix_r(
     if not combos:
         raise ValueError("tidak ada kombinasi seed+r yang muat payload")
 
-    if not parallel or len(combos) < 4:
+    use_parallel = parallel and len(combos) >= 4
+    if use_parallel and _running_in_subprocess() and not allow_nested_parallel:
+        use_parallel = False
+
+    if not use_parallel:
         eval_rows = _serial_search(
             cover, payload_bits, combos,
             embed_scope=embed_scope, virtual_mode=virtual_mode,
@@ -181,7 +190,7 @@ def _parallel_search(
 ) -> List[Tuple[int, int, int, int, float]]:
     if max_workers is None:
         max_workers = os.cpu_count() or 1
-    max_workers = max(1, min(int(max_workers), len(combos)))
+    max_workers = max(1, min(int(max_workers), len(combos), 4))
 
     state = _WorkerState(
         cover=np.asarray(cover, dtype=np.uint8),

@@ -2,20 +2,28 @@
 """
 Batch evaluasi: grid (cover x payload) -> CSV PSNR/SSIM.
 
-Paralel di dua tingkat:
-  1. antar sel (cover x payload) via ProcessPoolExecutor spawn
-  2. pencarian seed+r di dalam tiap sel (hmf.search, spawn)
+Paralel antar sel via ProcessPoolExecutor (spawn).
+Pencarian seed+r di tiap sel serial by default (hindari spawn di dalam spawn).
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import inspect
 import os
 import time
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import BrokenExecutor, ProcessPoolExecutor, as_completed
+
+try:
+    from concurrent.futures.process import BrokenProcessPool
+except ImportError:
+    BrokenProcessPool = BrokenExecutor  # type: ignore[misc, assignment]
+
 import multiprocessing as mp
 from pathlib import Path
+_POOL_ERRORS = (BrokenExecutor, BrokenProcessPool, OSError, RuntimeError)
+
 from typing import Dict, List, Tuple
 
 for _var in (
@@ -89,7 +97,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--virtual-key", type=int, default=5, choices=sorted(KEY_TO_MODE))
     p.add_argument("--no-huffman", action="store_true")
     p.add_argument("--workers", type=int, default=None, help="worker antar-sel")
-    p.add_argument("--search-workers", type=int, default=None, help="worker pencarian seed+r")
+    p.add_argument("--search-workers", type=int, default=None, help="worker pencarian seed+r (hanya dengan --parallel-search)")
+    p.add_argument("--parallel-search", action="store_true", help="paralel seed+r di tiap sel (hanya aman dengan --serial)")
     p.add_argument("--output-dir", default="output")
     p.add_argument("--serial", action="store_true", help="tanpa paralel antar-sel")
     return p.parse_args()
@@ -215,50 +224,104 @@ def _write_matrix(path: Path, corner: str, payload_labels: List[str], results: D
             )
 
 
-def run_batch(cfg: Dict) -> None:
-    tasks = [(cl, cr, pl, pr) for cl, cr in COVERS for pl, pr in PAYLOADS]
-    total = len(tasks)
-    results: Dict = {}
-    out_dir = BASE / cfg["output_dir"]
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    detail_path = out_dir / "results_psnr_ssim.csv"
-    with detail_path.open("w", newline="", encoding="utf-8") as detail_file:
+def _write_detail_csv(path: Path, tasks: List[Tuple], results: Dict) -> None:
+    with path.open("w", newline="", encoding="utf-8") as detail_file:
         writer = csv.DictWriter(detail_file, fieldnames=FIELDNAMES)
         writer.writeheader()
+        for cover_label, _, payload_label, _ in tasks:
+            row = results.get((cover_label, payload_label))
+            if row is not None:
+                writer.writerow(row)
 
-        def record(row: Dict, idx: int) -> None:
-            results[(row["cover"], row["payload"])] = row
-            writer.writerow(row)
-            detail_file.flush()
-            print(
-                f"[{idx}/{total}] {row['cover']} x {row['payload']}: "
-                f"{row['status']} | seed={row['seed']} r={row['matrix_r']} "
-                f"PSNR={row['psnr_db']} SSIM={row['ssim']} ({row['seconds']}s)",
-                flush=True,
-            )
 
-        t_batch = time.time()
+def _run_cells(tasks: List[Tuple], cfg: Dict, *, label: str) -> Dict[Tuple[str, str], Dict]:
+    results: Dict[Tuple[str, str], Dict] = {}
+    total = len(tasks)
+    failed_tasks: List[Tuple] = []
 
-        if cfg.get("serial"):
-            for i, task in enumerate(tasks, 1):
-                record(_run_cell(task, cfg), i)
-        else:
-            max_workers = cfg.get("workers") or min(os.cpu_count() or 1, 8)
-            ctx = mp.get_context("spawn")
-            print(f"Batch: {total} sel, {max_workers} worker spawn", flush=True)
-            done = 0
-            with ProcessPoolExecutor(max_workers=max_workers, mp_context=ctx) as pool:
-                futures = {pool.submit(_run_cell, t, cfg): t for t in tasks}
-                for fut in as_completed(futures):
-                    done += 1
-                    try:
-                        row = fut.result()
-                    except Exception as exc:
-                        cl, _, pl, _ = futures[fut]
-                        row = {k: "" for k in FIELDNAMES}
-                        row.update({"cover": cl, "payload": pl, "status": f"WORKER_FAIL: {type(exc).__name__}"})
-                    record(row, done)
+    def record(row: Dict, idx: int) -> None:
+        key = (row["cover"], row["payload"])
+        results[key] = row
+        prefix = f"{label} " if label else ""
+        print(
+            f"[{prefix}{idx}/{total}] {row['cover']} x {row['payload']}: "
+            f"{row['status']} | seed={row['seed']} r={row['matrix_r']} "
+            f"PSNR={row['psnr_db']} SSIM={row['ssim']} ({row['seconds']}s)",
+            flush=True,
+        )
+
+    if cfg.get("serial"):
+        for i, task in enumerate(tasks, 1):
+            record(_run_cell(task, cfg), i)
+        return results
+
+    max_workers = cfg.get("workers") or min(os.cpu_count() or 1, 4)
+    ctx = mp.get_context("spawn")
+    pool_kwargs = {"max_workers": max_workers, "mp_context": ctx}
+    if "max_tasks_per_child" in inspect.signature(ProcessPoolExecutor).parameters:
+        pool_kwargs["max_tasks_per_child"] = 1
+
+    print(f"Batch: {total} sel, {max_workers} worker spawn", flush=True)
+    done = 0
+    pending = dict.fromkeys(tasks, True)
+
+    try:
+        with ProcessPoolExecutor(**pool_kwargs) as pool:
+            futures = {pool.submit(_run_cell, t, cfg): t for t in tasks}
+            for fut in as_completed(futures):
+                done += 1
+                task = futures[fut]
+                pending.pop(task, None)
+                try:
+                    row = fut.result()
+                except _POOL_ERRORS as exc:
+                    failed_tasks.append(task)
+                    cl, _, pl, _ = task
+                    row = {k: "" for k in FIELDNAMES}
+                    row.update({
+                        "cover": cl,
+                        "payload": pl,
+                        "virtual_key": cfg["virtual_key"],
+                        "virtual_mode": cfg["virtual_mode"],
+                        "status": f"WORKER_FAIL: {type(exc).__name__}",
+                        "seconds": "",
+                    })
+                except Exception as exc:
+                    failed_tasks.append(task)
+                    cl, _, pl, _ = task
+                    row = {k: "" for k in FIELDNAMES}
+                    row.update({
+                        "cover": cl,
+                        "payload": pl,
+                        "virtual_key": cfg["virtual_key"],
+                        "virtual_mode": cfg["virtual_mode"],
+                        "status": f"WORKER_FAIL: {type(exc).__name__}: {exc}",
+                        "seconds": "",
+                    })
+                record(row, done)
+    except _POOL_ERRORS as exc:
+        print(f"[pool rusak: {type(exc).__name__}: {exc}] -> retry sisa sel serial", flush=True)
+        failed_tasks.extend(task for task in pending)
+
+    if failed_tasks:
+        retry_cfg = {**cfg, "serial": True, "parallel_search": False}
+        unique_failed = list(dict.fromkeys(failed_tasks))
+        print(f"\nRetry {len(unique_failed)} sel gagal (serial)...", flush=True)
+        for i, task in enumerate(unique_failed, 1):
+            record(_run_cell(task, retry_cfg), i)
+
+    return results
+
+
+def run_batch(cfg: Dict) -> None:
+    tasks = [(cl, cr, pl, pr) for cl, cr in COVERS for pl, pr in PAYLOADS]
+    out_dir = BASE / cfg["output_dir"]
+    out_dir.mkdir(parents=True, exist_ok=True)
+    detail_path = out_dir / "results_psnr_ssim.csv"
+
+    t_batch = time.time()
+    results = _run_cells(tasks, cfg, label="")
+    _write_detail_csv(detail_path, tasks, results)
 
     payload_labels = [pl for pl, _ in PAYLOADS]
     _write_matrix(out_dir / "psnr_matrix.csv", "PSNR_dB (cover \\ payload)", payload_labels, results, "psnr_db")
@@ -273,6 +336,16 @@ def run_batch(cfg: Dict) -> None:
 
 def main() -> None:
     args = parse_args()
+    batch_parallel = not args.serial
+    parallel_search = args.parallel_search
+    if batch_parallel and parallel_search:
+        print(
+            "Peringatan: --parallel-search dinonaktifkan saat batch paralel "
+            "(spawn di dalam spawn tidak stabil). Gunakan --serial --parallel-search jika perlu.",
+            flush=True,
+        )
+        parallel_search = False
+
     cfg = {
         "virtual_key": args.virtual_key,
         "virtual_mode": resolve_mode(args.virtual_key),
@@ -281,7 +354,7 @@ def main() -> None:
         "search_workers": args.search_workers,
         "output_dir": args.output_dir,
         "serial": args.serial,
-        "parallel_search": True,
+        "parallel_search": parallel_search,
     }
     run_batch(cfg)
 
